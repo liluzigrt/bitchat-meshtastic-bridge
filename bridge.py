@@ -6,8 +6,7 @@ import time
 import hashlib
 import uuid
 from dotenv import load_dotenv, set_key
-from bleak import BleakClient
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 
 # Cryptography
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
@@ -23,7 +22,11 @@ CHUNK_SIZE = 20
 TYPE_IDENTITY = 0x01
 TYPE_CHAT     = 0x02
 TYPE_REQUEST  = 0x20
+TYPE_REQUEST  = 0x20
 TYPE_ACK      = 0x21
+
+# Bitchat Service UUID
+SERVICE_UUID = "f47b5e2d-4a9e-4c5a-9b3f-8e1d2c3a4b5c"
 
 class IdentityManager:
     def __init__(self):
@@ -54,7 +57,7 @@ class IdentityManager:
         print(f"[KEY] Identity: {self.node_id_hex}")
 
     def _gen_new(self):
-        print("[INFO] Generating New Keys...")
+        print(f"[INFO] Generating New Keys and saving to {KEY_FILE}...")
         self.sign_key = ed25519.Ed25519PrivateKey.generate()
         self.enc_key = x25519.X25519PrivateKey.generate()
         with open(KEY_FILE, "w") as f:
@@ -160,13 +163,24 @@ class BitchatProtocol:
                     return payload.decode('utf-8', errors='ignore')
 
             return f"[Type {m_type}]"
-        except: return ""
+        except Exception as e:
+            print(f"[ERR] Decode: {e}")
+            return ""
 
 class BitchatBridge:
     def __init__(self):
         self.uuid = os.getenv("BITCHAT_UUID")
-        self.w_uuid = os.getenv("WRITE_UUID")
-        self.n_uuid = os.getenv("NOTIFY_UUID")
+        self._orig_w_uuid = os.getenv("WRITE_UUID")
+        self._orig_n_uuid = os.getenv("NOTIFY_UUID")
+        
+        self.w_uuid = self._orig_w_uuid
+        self.n_uuid = self._orig_n_uuid
+        
+        # If config has standard UUIDs (0000...), ignore them to force rescan
+        # BUT keep them as fallback in _orig_*
+        if self.w_uuid and self.w_uuid.startswith("0000"): self.w_uuid = None
+        if self.n_uuid and self.n_uuid.startswith("0000"): self.n_uuid = None
+        
         self.cli = None
         self.proto = BitchatProtocol(IdentityManager())
         self.send_queue = asyncio.Queue()
@@ -193,6 +207,7 @@ class BitchatBridge:
         await self.send_queue.put(pkt)
 
     async def notify(self, s, d):
+        # Debug: Print raw packet to verify reception
         msg = BitchatProtocol.decode(d)
         if msg:
             if "[Type 1]" in msg:
@@ -227,11 +242,53 @@ class BitchatBridge:
 
     async def start(self):
         print("--- [Meshtastic-Bitchat Bridge Experiment] ---")
+
+        # 0. Ensure .env exists and is valid
+        env_path = os.path.abspath(ENV_FILE)
+        print(f"[INFO] Loading Config from: {env_path}")
+
+        if not os.path.exists(ENV_FILE) or os.path.getsize(ENV_FILE) == 0:
+            print(f"[INFO] {ENV_FILE} missing or empty. Creating default...")
+            with open(ENV_FILE, "w") as f:
+                f.write("BITCHAT_UUID=\n")
+                f.write("BITCHAT_NICKNAME=MacBridge\n")
+                f.write("# Optional: Manually set Write/Notify UUIDs if auto-discovery fails\n")
+                f.write("# WRITE_UUID=\n")
+                f.write("# NOTIFY_UUID=\n")
+            
+        # Reload to pick up defaults
+        load_dotenv(ENV_FILE)
+        # Re-read UUID
+        self.uuid = os.getenv("BITCHAT_UUID")
         
         # Scan for devices if UUID is missing or generic
         if not self.uuid:
-             print("[ERROR] BITCHAT_UUID not set in .env")
-             return
+             print("[INFO] BITCHAT_UUID not set in .env. Scanning for Bitchat devices...")
+             # Inspect script found this service UUID: f47b5e2d-4a9e-4c5a-9b3f-8e1d2c3a4b5c
+             
+             # Use return_adv=True to get RSSI reliably
+             devices = await BleakScanner.discover(service_uuids=[SERVICE_UUID], timeout=5.0, return_adv=True)
+             
+             if devices:
+                 # devices is a dict: address -> (device, advertisement_data)
+                 # Sort by RSSI (strongest signal first)
+                 target_pair = sorted(devices.values(), key=lambda p: p[1].rssi, reverse=True)[0]
+                 target_device = target_pair[0]
+                 
+                 print(f"[INFO] Found Device: {target_device.name} ({target_device.address})")
+                 self.uuid = target_device.address
+                 
+                 # Save to .env
+                 set_key(ENV_FILE, "BITCHAT_UUID", self.uuid)
+                 
+                 # Set default nickname if missing
+                 if not os.getenv("BITCHAT_NICKNAME"):
+                     set_key(ENV_FILE, "BITCHAT_NICKNAME", "MacBridge")
+                     print(f"[INFO] Set default nickname: MacBridge")
+             else:
+                 print("[WARN] No Bitchat devices found via BLE Scan.")
+                 print(f"[INFO] Please manually configure {ENV_FILE} with your BITCHAT_UUID if known.")
+                 return
 
         print(f"[INFO] Connecting to {self.uuid}...")
 
@@ -239,17 +296,68 @@ class BitchatBridge:
             self.cli = client
             print("[INFO] Connected!")
             
-            if not self.w_uuid:
+            # Smart Discovery: Find the best characteristic (Write + Notify)
+            if not self.w_uuid or not self.n_uuid:
+                print(f"[INFO] Auto-discovering services...")
+                best_char = None
+                best_score = -1
+
                 for s in client.services:
                     for c in s.characteristics:
-                        if "write" in c.properties: 
-                            self.w_uuid = c.uuid
-                            set_key(ENV_FILE, "WRITE_UUID", self.w_uuid)
-                            print(f"Found Write Char: {self.w_uuid}")
-                        if "notify" in c.properties: 
-                            self.n_uuid = c.uuid
-                            set_key(ENV_FILE, "NOTIFY_UUID", self.n_uuid)
-                            print(f"Found Notify Char: {self.n_uuid}")
+                        score = 0
+                        props = c.properties
+                        
+                        # HUGE Bonus if it belongs to the known Bitchat Service
+                        if str(s.uuid) == SERVICE_UUID:
+                            score += 100
+                        
+                        # Penalize standard/system services to avoid false positives
+                        if str(c.uuid).startswith("0000"):
+                            score -= 5
+                        
+                        # Bonus for custom UUIDs (likely the target)
+                        if not str(c.uuid).startswith("0000"):
+                            score += 10
+
+                        if "write" in props or "write-without-response" in props:
+                            score += 10
+                        if "notify" in props:
+                            score += 10
+                        
+                        # Perfect match: Write + Notify
+                        if ("write" in props or "write-without-response" in props) and "notify" in props:
+                            score += 20
+
+                        if score > best_score:
+                            best_score = score
+                            best_char = c
+
+                if best_char:
+                    print(f"[INFO] Found Best Characteristic: {best_char.uuid} (Score: {best_score})")
+                    self.w_uuid = best_char.uuid
+                    self.n_uuid = best_char.uuid
+                    
+                    # Persist to .env
+                    set_key(ENV_FILE, "WRITE_UUID", str(self.w_uuid))
+                    set_key(ENV_FILE, "NOTIFY_UUID", str(self.n_uuid))
+                else:
+                    print("[WARN] Could not find a suitable characteristic.")
+
+            # Fallback to .env values if scan failed
+            
+            # Fallback to .env values if scan failed
+            if not self.w_uuid and self._orig_w_uuid:
+                print(f"[WARN] Scan failed for Write Char, using .env: {self._orig_w_uuid}")
+                self.w_uuid = self._orig_w_uuid
+
+            if not self.n_uuid and self._orig_n_uuid:
+                print(f"[WARN] Scan failed for Notify Char, using .env: {self._orig_n_uuid}")
+                self.n_uuid = self._orig_n_uuid
+            
+            # Critical check before crashing
+            if not self.n_uuid:
+                print("[ERROR] No Notify Characteristic found! Check device or .env configuration.")
+                return
             
             await client.start_notify(self.n_uuid, self.notify)
             

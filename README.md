@@ -14,16 +14,19 @@ This project aims to act as a bridge, allowing Bitchat users (typically on iPhon
 
 ## Project Status
 
-**⚠️ Experimental / Work in Progress**
+**Testing & Development**
 
-This project is currently in an experimental state.
+- **Current Capabilities**:
+    - ✅ **BLE Scanning**: Automatically finds Bitchat devices (iPhone/Mac) advertising the service.
+    - ✅ **Identity Generation**: Creates and persists cryptographic keys (`mac_identity.json`) for the bridge.
+    - ✅ **RX (Receive)**: Successfully connects and receives signed messages from Bitchat.
+    - ✅ **Smart Discovery**: Auto-detects the best Write/Notify characteristics if standard ones fail.
+    - ⚠️ **TX (Transmit)**: The bridge can send data, but the iPhone app currently rejects it (likely due to strict signature/TTL verification).
+    - ❌ **Meshtastic Integration**: Not yet implemented. This script currently only bridges Bitchat <-> Python (Host).
 
-- **Tested Environment**: 
-    - Apple Silicon Mac (M2) running the bridge script.
-    - iPhone running Bitchat.
-- **Current Functionality**:
-    - ✅ **RX (Receive)**: The Mac bridge successfully connects to the iPhone via BLE and receives messages sent from the Bitchat app.
-    - ❌ **TX (Transmit)**: The Mac bridge can *send* packets to the iPhone, but the iPhone currently does not display them. This is likely due to strict packet signature or TTL validation logic in the Bitchat app that needs further reverse engineering.
+- **Next Steps**:
+    - Fix TX signature verification.
+    - Integrate `meshtastic` python library to forward messages to the mesh.
 
 ## Setup & Usage
 
@@ -38,17 +41,23 @@ cd bridge
 pip install -r requirements.txt
 ```
 
-### 3. Configuration
-Copy the example environment file:
-```bash
-cp .env.example .env
-```
-Edit `.env` and fill in your device details:
+### 3. Configuration (Optional)
+**Zero-Config Mode**: 
+The bridge is designed to be plug-and-play. On first run:
+1. It scans for any BLE device advertising the Bitchat service.
+2. It automatically negotiates the best "Write" and "Notify" characteristics (Smart Discovery).
+3. It saves the found device UUID and characteristics to `.env`.
+
+**Manual Configuration**:
+If you prefer to configure it manually or if auto-discovery fails:
+1. Run the script once to generate the `.env` file.
+2. Edit `.env` and fill in your device details:
 ```env
 BITCHAT_UUID=<Your iPhone UUID>
 BITCHAT_NICKNAME=MacBridge
 ```
-*Note: You can find your iPhone's UUID using a BLE scanner app, or the script may help identify it.*
+*Note: You can find your iPhone's UUID using a BLE scanner app (like LightBlue or nRF Connect).*
+
 
 ### 4. Running
 ```bash
@@ -61,6 +70,18 @@ The script uses cryptographic keys to identify itself on the mesh/chat.
 - **Auto-Generation**: If this file does not exist, `bridge.py` will automatically generate a fresh identity on the first run.
 - **Resetting Identity**: If you wish to generate a new identity, simply delete `mac_identity.json` and run the script again.
 - **Security**: Do not commit this file to GitHub! It is already excluded by `.gitignore`.
+
+### 6. Troubleshooting
+
+**"Permission Denied" or No Devices Found on macOS**:
+- macOS requires apps to have explicit permission to use Bluetooth.
+- If running from **Terminal**, you must grant Terminal access to Bluetooth in **System Settings > Privacy & Security > Bluetooth**.
+- If running from VS Code, grant VS Code permission.
+
+**Connection Failed**:
+- Ensure Bitchat is open and in the foreground on the iPhone.
+- Try toggling Bluetooth on the Mac.
+- Delete `.env` to force a fresh scan if you changed devices.
 
 ## Contributing
 If you are interested in helping fix the TX (Transmit) issue, please submit a PR! We suspect the issue lies in how the `TTL` field is handled in the packet signature verification on the Receiving (iPhone) side.
