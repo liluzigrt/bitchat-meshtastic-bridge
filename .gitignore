@@ -1,0 +1,5 @@
+.env
+mac_identity.json
+__pycache__/
+*.pyc
+*.json
