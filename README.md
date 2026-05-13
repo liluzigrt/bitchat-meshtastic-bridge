@@ -21,12 +21,12 @@ This project aims to act as a bridge, allowing Bitchat users (typically on iPhon
     - ✅ **Identity Generation**: Creates and persists cryptographic keys (`mac_identity.json`) for the bridge.
     - ✅ **RX (Receive)**: Successfully connects and receives signed messages from Bitchat.
     - ✅ **Smart Discovery**: Auto-detects the best Write/Notify characteristics if standard ones fail.
-    - ⚠️ **TX (Transmit)**: The bridge can send data, but the iPhone app currently rejects it (likely due to strict signature/TTL verification).
+    - ✅ **TX (Transmit)**: Successfully reverse-engineered the iOS signature padding rules and TLV packet structure. The bridge can now send verified, encrypted private messages to Bitchat.
     - ❌ **Meshtastic Integration**: Not yet implemented. This script currently only bridges Bitchat <-> Python (Host).
 
 - **Next Steps**:
-    - Fix TX signature verification.
     - Integrate `meshtastic` python library to forward messages to the mesh.
+    - Expand support for group chat messages and media types.
 
 ## Setup & Usage
 
@@ -84,4 +84,4 @@ The script uses cryptographic keys to identify itself on the mesh/chat.
 - Delete `.env` to force a fresh scan if you changed devices.
 
 ## Contributing
-If you are interested in helping fix the TX (Transmit) issue, please submit a PR! We suspect the issue lies in how the `TTL` field is handled in the packet signature verification on the Receiving (iPhone) side.
+Contributions are welcome! Specifically looking for help integrating the `meshtastic` python library to complete the bridge and route messages over the LoRa mesh network.

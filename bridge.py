@@ -28,6 +28,114 @@ TYPE_ACK      = 0x21
 # Bitchat Service UUID
 SERVICE_UUID = "f47b5e2d-4a9e-4c5a-9b3f-8e1d2c3a4b5c"
 
+# --- HELPER CLASSES ---
+
+class MessagePadding:
+    """
+    Implements Bitchat's privacy padding (PKCS#7 style to optimal block size).
+    Reference: MessagePadding.swift
+    """
+    BLOCK_SIZES = [256, 512, 1024, 2048]
+
+    @staticmethod
+    def pad(data: bytes) -> bytes:
+        length = len(data)
+        # Account for encryption overhead (approx 16 bytes for AES-GCM tag in Bitchat)
+        total_size = length + 16
+        
+        target_size = length # fallback
+        for bs in MessagePadding.BLOCK_SIZES:
+            if total_size <= bs:
+                target_size = bs
+                break
+        
+        if target_size == length:
+            return data
+
+        padding_needed = target_size - length
+        if padding_needed <= 0 or padding_needed > 255:
+            return data
+            
+        # PKCS#7: All pad bytes are equal to the pad length
+        return data + bytes([padding_needed] * padding_needed)
+
+    @staticmethod
+    def unpad(data: bytes) -> bytes:
+        if not data: return data
+        pad_len = data[-1]
+        if pad_len == 0 or pad_len > len(data): return data
+        
+        # Verify padding? Bitchat swift checks if all bytes match.
+        padding = data[-pad_len:]
+        for b in padding:
+            if b != pad_len: return data # Invalid padding
+            
+        return data[:-pad_len]
+
+class AnnouncementPacket:
+    """
+    TLV Encoded Announcement Packet.
+    """
+    TYPE_NICKNAME = 0x01
+    TYPE_NOISE_KEY = 0x02
+    TYPE_SIGN_KEY = 0x03
+    TYPE_NEIGHBORS = 0x04
+
+    def __init__(self, nickname, noise_pub, sign_pub):
+        self.nickname = nickname
+        self.noise_pub = noise_pub
+        self.sign_pub = sign_pub
+
+    def encode(self) -> bytes:
+        data = bytearray()
+        
+        # TLV Nickname
+        nick_bytes = self.nickname.encode('utf-8')[:255]
+        data.append(self.TYPE_NICKNAME)
+        data.append(len(nick_bytes))
+        data.extend(nick_bytes)
+        
+        # TLV Noise Key
+        data.append(self.TYPE_NOISE_KEY)
+        data.append(len(self.noise_pub))
+        data.extend(self.noise_pub)
+        
+        # TLV Signing Key
+        data.append(self.TYPE_SIGN_KEY)
+        data.append(len(self.sign_pub))
+        data.extend(self.sign_pub)
+        
+        return bytes(data)
+
+class PrivateMessagePacket:
+    """
+    TLV Encoded Private Message Packet (Inner Payload).
+    Reference: Packets.swift
+    """
+    TYPE_MSG_ID = 0x00
+    TYPE_CONTENT = 0x01
+    
+    def __init__(self, msg_id, content):
+        self.msg_id = msg_id
+        self.content = content
+        
+    def encode(self) -> bytes:
+        data = bytearray()
+        
+        # TLV Msg ID
+        mid_bytes = self.msg_id.encode('utf-8')[:255]
+        data.append(self.TYPE_MSG_ID)
+        data.append(len(mid_bytes))
+        data.extend(mid_bytes)
+        
+        # TLV Content
+        txt_bytes = self.content.encode('utf-8')[:255]
+        data.append(self.TYPE_CONTENT)
+        data.append(len(txt_bytes))
+        data.extend(txt_bytes)
+        
+        return bytes(data)
+
 class IdentityManager:
     def __init__(self):
         self.load_keys()
@@ -73,72 +181,69 @@ class BitchatProtocol:
     def __init__(self, identity):
         self.id = identity
 
-    def pkcs7_pad(self, data: bytes) -> bytes:
-        """STRICT PKCS#7 Padding."""
-        length = len(data)
-        if length < 256: target = 256
-        elif length < 512: target = 512
-        else: target = 1024
-        
-        padding_len = target - length
-        pad_byte = padding_len if padding_len < 256 else 0x00 
-        return data + bytes([pad_byte] * padding_len)
-
     def encode_chat(self, text):
         """
-        Constructs Chat Struct:
-        [Flags(1)][Time(8)][UUIDLen(1)][UUIDString][NickLen(1)][Nick][MsgLen(2)][Msg]
+        Constructs Chat Payload:
+        PrivateMessagePacket (TLV)
         """
-        flags = 0x00 
-        ts = int(time.time() * 1000)
-        
-        msg_uuid_str = str(uuid.uuid4()).encode('utf-8')
-        uuid_len = len(msg_uuid_str)
-        
-        nickname = os.getenv("BITCHAT_NICKNAME", "Bridge").encode('utf-8')
-        nick_len = len(nickname)
-        
-        content = text.encode('utf-8')
-        content_len = len(content)
-
-        inner = struct.pack("<BQ", flags, ts)
-        inner += struct.pack("B", uuid_len) + msg_uuid_str
-        inner += struct.pack("B", nick_len) + nickname
-        inner += struct.pack("<H", content_len) + content
-        
-        return self._packet(TYPE_CHAT, inner)
+        # Generate random message ID
+        msg_id = str(uuid.uuid4())
+        packet = PrivateMessagePacket(msg_id, text)
+        return self._packet(TYPE_CHAT, packet.encode())
 
     def encode_identity(self):
-        name = os.getenv("BITCHAT_NICKNAME", "Bridge").encode('utf-8')
-        tlv = b'\x01' + bytes([len(name)]) + name
-        tlv += b'\x02\x20' + self.id.sign_pub
-        tlv += b'\x03\x20' + self.id.enc_pub
-        return self._packet(TYPE_IDENTITY, tlv)
+        name = os.getenv("BITCHAT_NICKNAME", "Bridge")
+        # Ensure we send the keys correctly
+        packet = AnnouncementPacket(
+            nickname=name,
+            noise_pub=self.id.enc_pub,
+            sign_pub=self.id.sign_pub
+        )
+        return self._packet(TYPE_IDENTITY, packet.encode())
 
     def _packet(self, type_byte, payload):
         ts = int(time.time()*1000)
         
-        # 1. LIVE HEADER (TTL = 7) - This goes on the wire
-        # Header: Ver(1) Type(x) TTL(7) Time(8) Flags(2=Signed) Len(2)
+        # 1. LIVE HEADER (TTL = 7, Flags = 0x02 for HasSignature)
+        # Reverted to 14-Byte Header (Ver, Type, TTL, Time, Flags, Len)
         live_hdr = struct.pack(">BBBQBH", 1, type_byte, 7, ts, 0x02, len(payload))
         
-        # 2. SIGNING
-        # FIX: The iPhone might be expecting the specific wire bytes to be signed 
-        # since it's a direct connection. We will sign the LIVE header.
-        base_for_sig = live_hdr + self.id.sender_id + payload
-        sig = self.id.sign(base_for_sig)
+        # 2. SIGNING LOGIC
+        # We must sign the "Canonical" serialization of the packet.
+        # Rule 1: TTL is 0.
+        # Rule 2: Signature Flag (0x02) is cleared.
+        # Rule 3: RSR Flag (0x10) is cleared (we aren't setting it anyway).
         
-        # 4. Construct Final Packet
+        sign_hdr = struct.pack(">BBBQBH", 1, type_byte, 0, ts, 0x00, len(payload))
+        
+        # Unsigned Blob: Header(Modified) + SenderID + Payload
+        unsigned_blob = sign_hdr + self.id.sender_id + payload
+        
+        # Rule 4: PADDING
+        # The signature is calculated over the PADDED blob.
+        padded_blob = MessagePadding.pad(unsigned_blob)
+        
+        # Sign
+        sig = self.id.sign(padded_blob)
+        
+        # 3. Construct Final Wire Packet
+        # Live Header + SenderID + Payload + Signature
+        # Note: The wire packet itself is NOT padded for these message types.
         final_packet = live_hdr + self.id.sender_id + payload + sig
         
-        return self.pkcs7_pad(final_packet)
+        return final_packet
 
     @staticmethod
     def decode(data: bytes):
+        # DEBUG: Print Raw Hex
+        # print(f"[DEBUG] RX HEX: {data.hex()}")
+        
         if len(data) < 22: return ""
         try:
             m_type = data[1]
+            # Reverted to 14-byte header offsets (Len at 12:14)
             p_len = struct.unpack(">H", data[12:14])[0]
+            
             if len(data) < 22 + p_len: return ""
             payload = data[22 : 22 + p_len]
             
@@ -147,18 +252,27 @@ class BitchatProtocol:
             if m_type == TYPE_ACK:      return "[Ack]"
             
             if m_type == TYPE_CHAT:
+                # Try to decode TLV PrivateMessagePacket
                 try:
-                    cursor = 9
-                    uuid_len = payload[cursor]
-                    cursor += 1 + uuid_len
-                    nick_len = payload[cursor]
-                    cursor += 1
-                    nick = payload[cursor:cursor+nick_len].decode('utf-8')
-                    cursor += nick_len
-                    msg_len = struct.unpack("<H", payload[cursor:cursor+2])[0]
-                    cursor += 2
-                    msg = payload[cursor:cursor+msg_len].decode('utf-8')
-                    return f"{nick}: {msg}"
+                    # Quick TLV parser for MsgID(00) and Content(01)
+                    cursor = 0
+                    content = ""
+                    while cursor + 2 <= len(payload):
+                        t_type = payload[cursor]
+                        t_len = payload[cursor+1]
+                        cursor += 2
+                        if cursor + t_len > len(payload): break
+                        val = payload[cursor : cursor+t_len]
+                        cursor += t_len
+                        
+                        if t_type == 0x01: # Content
+                            content = val.decode('utf-8')
+                            
+                    if content:
+                        return f"Message: {content}"
+                        
+                    # Fallback to old format if needed?
+                    return "(Private Message)"
                 except:
                     return payload.decode('utf-8', errors='ignore')
 
